@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-from functools import wraps
+from collections import defaultdict
 
 import requests
 from flask import Flask, request, jsonify
@@ -15,6 +15,11 @@ BASIC_AUTH_PASS = os.environ.get('BASIC_AUTH_PASS', '')
 ENABLE_AUTH = bool(BASIC_AUTH_USER and BASIC_AUTH_PASS)
 PORT = int(os.environ.get('PORT', 8080))
 DEBUG = os.environ.get('DEBUG', 'false').lower() == 'true'
+
+# Опциональные URL для ссылок в подвале сообщения
+GRAFANA_URL = os.environ.get('GRAFANA_URL', '')
+ALERTMANAGER_URL = os.environ.get('ALERTMANAGER_URL', '')
+PROMETHEUS_URL = os.environ.get('PROMETHEUS_URL', '')
 
 YANDEX_MESSENGER_URL = 'https://botapi.messenger.yandex.net/bot/v1/messages/sendText/'
 
@@ -38,37 +43,96 @@ if ENABLE_AUTH:
 else:
     logger.info("Basic authentication disabled (credentials not set)")
 
-# ---------- Вспомогательные функции ----------
-def format_alert(alert):
-    """Форматирует одно оповещение Alertmanager в строку."""
+# ---------- Форматирование одного алерта ----------
+def format_single_alert(alert):
+    """Форматирует один алерт в читаемый блок (без заголовка статуса)."""
     labels = alert.get('labels', {})
     annotations = alert.get('annotations', {})
     status = alert.get('status', 'unknown')
-    alert_name = labels.get('alertname', 'Без имени')
+    alertname = labels.get('alertname', 'Без имени')
     severity = labels.get('severity', 'не указана')
+    
+    # Выбор эмодзи для severity
+    severity_emoji = {
+        'critical': '🚨',
+        'warning': '⚠️',
+        'info': 'ℹ️',
+        'не указана': '🔔'
+    }.get(severity, '🔔')
+    
     summary = annotations.get('summary', 'Нет описания')
     description = annotations.get('description', '')
-    starts_at = alert.get('startsAt', '')
-    return (
-        f"🔔 **{alert_name}** (важность: {severity})\n"
-        f"Статус: {status}\n"
-        f"Описание: {summary}\n"
-        f"{description}\n"
-        f"Время: {starts_at}\n"
-    )
-
-def build_message_from_alerts(alerts, status):
-    """Собирает итоговое сообщение из списка оповещений."""
-    if not alerts:
-        return "✅ Нет активных оповещений"
+    runbook_url = annotations.get('runbook_url', '')
+    # generator_url = alert.get('generatorURL', '')
     
-    header = f"🚨 **Alertmanager** – статус: {status.upper()}\n\n"
-    body = "\n".join(format_alert(alert) for alert in alerts)
-    full_msg = header + body
+    # Формируем блок
+    lines = [
+        "---",
+        f"🪪 {alertname}",
+        f"{severity_emoji} {severity.upper()} {severity_emoji}",
+        f"📝 {summary}",
+    ]
+    if description:
+        lines.append(f"📖 {description}")
+    if runbook_url:
+        lines.append(f"📔 {runbook_url}")
+    
+    # Вывод labels (исключаем служебные, если нужно)
+    if labels:
+        lines.append("🏷 Labels:")
+        for key, value in labels.items():
+            lines.append(f"  {key}: {value}")
+    
+    # generatorURL (ссылка на график в Prometheus)
+    # if generator_url:
+    #     lines.append(f"📊 Prometheus graph: {generator_url}")
+    
+    return "\n".join(lines)
+
+def build_footer():
+    """Формирует подвал с ссылками на Grafana, Alertmanager, Prometheus."""
+    footer_parts = []
+    if GRAFANA_URL:
+        footer_parts.append(f"🛠 Grafana ({GRAFANA_URL})")
+    if ALERTMANAGER_URL:
+        footer_parts.append(f"💊 Alertmanager ({ALERTMANAGER_URL})")
+    if PROMETHEUS_URL:
+        footer_parts.append(f"💊 Prometheus ({PROMETHEUS_URL})")
+    if not footer_parts:
+        return ""
+    return "\n\n" + " ".join(footer_parts)
+
+def build_message_for_status(alerts, status):
+    """
+    Собирает сообщение для списка алертов с одинаковым статусом.
+    Возвращает текст сообщения.
+    """
+    if not alerts:
+        return None
+    
+    # Заголовок в зависимости от статуса
+    if status == 'firing':
+        header = "🔥 Alerts Firing 🔥\n"
+    elif status == 'resolved':
+        header = "✅ Alerts Resolved ✅\n"
+    else:
+        header = f"📢 Alerts ({status.upper()})\n"
+    
+    # Форматируем каждый алерт
+    alert_blocks = [format_single_alert(alert) for alert in alerts]
+    body = "\n".join(alert_blocks)
+    
+    # Добавляем подвал
+    footer = build_footer()
+    
+    full_msg = header + body + footer
+    
+    # Ограничение длины сообщения (6000 символов)
     if len(full_msg) > 6000:
         full_msg = full_msg[:5997] + "..."
     return full_msg
 
+# ---------- Отправка в Яндекс Мессенджер ----------
 def send_to_yandex_messenger(chat_id, text):
     """Отправляет текстовое сообщение через API Яндекс Мессенджера."""
     headers = {
@@ -97,7 +161,7 @@ def send_to_yandex_messenger(chat_id, text):
 # ---------- Основной эндпоинт ----------
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    # 1. Проверка Basic Auth (если включена)
+    # 1. Проверка Basic Auth
     if ENABLE_AUTH:
         auth = request.authorization
         if not auth or auth.username != BASIC_AUTH_USER or auth.password != BASIC_AUTH_PASS:
@@ -110,7 +174,7 @@ def webhook():
         logger.error(f"Missing required header: {CHAT_ID_HEADER}")
         return jsonify({'error': f'Missing {CHAT_ID_HEADER} header'}), 400
 
-    # 3. Разбор тела запроса от Alertmanager
+    # 3. Разбор тела запроса
     try:
         payload = request.get_json()
         if not payload:
@@ -119,29 +183,47 @@ def webhook():
         logger.error(f"Invalid JSON: {e}")
         return jsonify({'error': 'Invalid JSON'}), 400
 
-    # ---- DEBUG: логируем исходный webhook ----
     if DEBUG:
         logger.debug(f"Received webhook payload (chat_id={chat_id}):\n{json.dumps(payload, indent=2, ensure_ascii=False)}")
 
-    # 4. Извлечение данных об оповещениях
-    status = payload.get('status', 'unknown')
+    # 4. Группировка алертов по статусу
     alerts = payload.get('alerts', [])
     if not alerts:
         logger.info("No alerts in payload, sending empty notification")
         text = "✅ Нет активных оповещений"
-    else:
-        text = build_message_from_alerts(alerts, status)
+        success, error_msg = send_to_yandex_messenger(chat_id, text)
+        if success:
+            return jsonify({'status': 'sent'}), 200
+        else:
+            return jsonify({'error': f'Yandex Messenger error: {error_msg}'}), 502
 
-    # ---- DEBUG: логируем сообщение перед отправкой ----
-    if DEBUG:
-        logger.debug(f"Prepared message to send (chat_id={chat_id}):\n{text}")
+    # Группируем
+    alerts_by_status = defaultdict(list)
+    for alert in alerts:
+        status = alert.get('status', 'unknown')
+        alerts_by_status[status].append(alert)
 
-    # 5. Отправка в Яндекс Мессенджер
-    success, error_msg = send_to_yandex_messenger(chat_id, text)
-    if success:
+    # Отправляем отдельное сообщение для каждого статуса
+    all_success = True
+    last_error = None
+    for status, status_alerts in alerts_by_status.items():
+        message = build_message_for_status(status_alerts, status)
+        if not message:
+            continue
+        
+        if DEBUG:
+            logger.debug(f"Prepared message for status '{status}' (chat_id={chat_id}):\n{message}")
+        
+        success, error_msg = send_to_yandex_messenger(chat_id, message)
+        if not success:
+            all_success = False
+            last_error = error_msg
+            logger.error(f"Failed to send message for status {status}: {error_msg}")
+    
+    if all_success:
         return jsonify({'status': 'sent'}), 200
     else:
-        return jsonify({'error': f'Yandex Messenger error: {error_msg}'}), 502
+        return jsonify({'error': f'Yandex Messenger error: {last_error}'}), 502
 
 # ---------- Healthcheck ----------
 @app.route('/health', methods=['GET'])
